@@ -16,6 +16,7 @@ object, so the caller can verify each step instead of guessing from the screen.
 | 依赖 | Python 3.8+、`pywin32` |
 | 单位 | 命令行一律毫米，内部换算成米 |
 | 输出 | 每命令一行 JSON |
+| 许可 | MIT |
 
 ![示例](docs/images/flange_demo.png)
 
@@ -171,4 +172,7 @@ examples/         示例 STEP 与演示脚本
 
 ## License
 
-尚未指定。若要公开发布，建议加一个 `LICENSE`（MIT 最省事）。
+[MIT](LICENSE) (c) 2026 matthewsu73
+
+本项目与 Dassault Systèmes 无关。SOLIDWORKS 是 Dassault Systèmes 的商标，
+使用本工具需要你自备合法授权的 SOLIDWORKS 副本。
