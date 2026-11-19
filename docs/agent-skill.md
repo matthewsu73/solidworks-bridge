@@ -50,6 +50,7 @@ description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程
 | 偏移曲面 | `offset-surface --distance 5 --faces all|near:x,y,z` |
 | 缝合曲面 | `sew --tolerance 0.01` |
 | 延伸曲面 | `extend-surface --distance 10 --edges all` |
+| 实体布尔 | `combine --operation subtract`（`add|subtract|intersect`，`--target largest|smallest|#i|near:x,y,z`，`--tools all|...`） |
 
 ### 草图 DSL（`--shapes`，分号或换行分隔，全为 mm）
 
@@ -124,6 +125,27 @@ centerline x1 y1 x2 y2            构造线/旋转轴（旋转、旋转曲面必
 最接近该点的单个面。加厚用 mark 1、偏移曲面用 mark 0、缝合体用 `Body2.Select(True, 1)`，
 这些标记已在 SW2025 上验证。
 
+### 阳模 → 阴模（布尔求差）
+
+阴模 = 料块 − 型芯实体。料块先拉伸成独立实体，型芯用曲面加厚得到，然后：
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "rect 0 0 120 120"
+.\sw.cmd extrude --depth 25                 # 料块 360000 mm3
+# ...建阳模曲面，再 thicken 成实体...
+.\sw.cmd combine --operation subtract --target largest
+```
+
+```jsonc
+{ "ok": true, "feature": "组合1", "operation": "subtract",
+  "target": "凸台-拉伸1", "target_volume_mm3": 360000.0,
+  "tools": ["凸台-拉伸2"], "volume_before_mm3": [12566.37, 360000.0],
+  "volume_mm3": 347433.63, "solid_bodies": 1 }
+```
+
+`--target` 默认 `largest`（体积最大的实体，通常就是料块）；`--tools all` 减掉其余全部实体。
+布尔只能作用于**实体**，所以型芯必须先 `thicken`。
+
 ## 标准工作流
 
 1. `new --type part`
@@ -143,6 +165,8 @@ centerline x1 y1 x2 y2            构造线/旋转轴（旋转、旋转曲面必
    不能凭返回值判断。
 5. **选面标记因命令而异**：加厚 `1`、偏移曲面 `0`、缝合体 `1`；标错时
    往往不报错也不生成特征。
+6. **布尔要传 VARIANT 数组**：`InsertCombineFeature(15902, commonBody, bodies)` 第三参必须是
+   `win32.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, [...])`，第二参也不能是 `None`。
 
 ## 自定义/扩展
 

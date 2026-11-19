@@ -35,4 +35,13 @@ Step "sk4"       @("sketch", "--plane", "right", "--shapes", "line 0 0 40 0")
 Step "sweep"     @("surface-sweep", "--outline", "草图1", "--path", "草图2")
 Step "info4"     @("info")
 
-Write-Host "expected: thicken 15900 mm3 / loft bbox 60x40x40 / sweep bbox 10x10x40" -ForegroundColor Green
+# 4. blank 120x120x25 minus a D40x10 boss -> 347433.63 mm3 (mould-style subtract)
+Step "new4"      @("new", "--type", "part")
+Step "sk5"       @("sketch", "--plane", "front", "--shapes", "rect 0 0 120 120")
+Step "blank"     @("extrude", "--depth", "25")
+Step "sk6"       @("sketch", "--plane", "front", "--shapes", "circle 0 0 20")
+Step "boss"      @("extrude", "--depth", "10", "--no-merge")
+Step "combine"   @("combine", "--operation", "subtract", "--target", "largest")
+Step "info5"     @("info")
+
+Write-Host "expected: thicken 15900 mm3 / loft bbox 60x40x40 / sweep bbox 10x10x40 / subtract 347433.63 mm3" -ForegroundColor Green

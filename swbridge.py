@@ -42,6 +42,8 @@ END_BLIND, END_THROUGH_ALL, END_MID_PLANE = 0, 1, 6
 SW_SOLID_BODY = 0    # GetBodies2(0) -> solid bodies (verified SW2025)
 SW_SURFACE_BODY = 1  # GetBodies2(1) -> surface / sheet bodies (verified SW2025)
 BODY_KINDS = {"solid": SW_SOLID_BODY, "surface": SW_SURFACE_BODY}
+# swBodyOperationType_e, verified on SW2025 via FeatureManager.InsertCombineFeature
+COMBINE_OPS = {"add": 15901, "subtract": 15902, "intersect": 15903}
 SW_START_SKETCH_PLANE = 0
 FILLET_UNIFORM = 2  # empirically required by FeatureFillet3 in SW2025
 
@@ -239,6 +241,33 @@ class Bridge:
             "max": [round(v, 3) for v in mx],
             "size": [round(mx[k] - mn[k], 3) for k in range(3)],
         }
+
+    def body_box_mm(self, body):
+        """Exact [xmin,ymin,zmin,xmax,ymax,zmax] for one body, in mm."""
+        mn = [float("inf")] * 3
+        mx = [float("-inf")] * 3
+        seen = False
+        for face in body.GetFaces():
+            data = face.GetTessTriangles(True)
+            if not data:
+                continue
+            seen = True
+            for i in range(0, len(data) - 2, 3):
+                for k in range(3):
+                    v = data[i + k] * 1000.0
+                    if v < mn[k]:
+                        mn[k] = v
+                    if v > mx[k]:
+                        mx[k] = v
+        if not seen:
+            return None
+        return mn + mx
+
+    def body_volume_mm3(self, body):
+        try:
+            return round(float(body.GetMassProperties(1000.0)[3]) * 1e9, 2)
+        except Exception:
+            return 0.0
 
     # -- sketching ---------------------------------------------------------- #
     def find_plane(self, plane):
@@ -581,6 +610,109 @@ class Bridge:
         name = self._created_feature(before, m, "extend surface")
         m.ClearSelection2(True)
         return {"ok": True, "feature": name, "edges": n}
+
+    # -- booleans ----------------------------------------------------------- #
+    def combine(self, operation="subtract", target="largest", tools="all"):
+        """Boolean between solid bodies.
+
+        Subtract keeps `--target` and removes `--tools` from it, which is the
+        mould workflow: target = blank block, tools = cavity solid.
+        """
+        m = self.model
+        key = (operation or "subtract").strip().lower()
+        if key not in COMBINE_OPS:
+            raise RuntimeError("unknown operation %r (add|subtract|intersect)" % operation)
+        solids = self.solid_bodies(m)
+        if len(solids) < 2:
+            raise RuntimeError(
+                "combine needs at least two solid bodies, found %d "
+                "(extrude with --no-merge / thicken separate surfaces)" % len(solids))
+
+        def center(body):
+            box = self.body_box_mm(body)
+            if box is None:
+                return None
+            return [(box[i] + box[i + 3]) / 2.0 for i in range(3)]
+
+        def near(spec, pool):
+            point = [float(x) * MM for x in spec[5:].split(",")[:3]]
+            best, best_d = None, None
+            for body in pool:
+                c = center(body)
+                if c is None:
+                    continue
+                d = sum((c[i] - point[i]) ** 2 for i in range(3))
+                if best_d is None or d < best_d:
+                    best_d, best = d, body
+            return best
+
+        def pick(spec, pool, what):
+            spec = (spec or "").strip().lower()
+            if spec.startswith("#"):
+                try:
+                    i = int(spec[1:])
+                except ValueError:
+                    raise RuntimeError("bad %s %r, use #index" % (what, spec))
+                if i < 0 or i >= len(solids):
+                    raise RuntimeError("%s index out of range: %s (have %d bodies)"
+                                       % (what, spec, len(solids)))
+                if not any(solids[i] is b for b in pool):
+                    raise RuntimeError("%s %s is not a usable %s body"
+                                       % (what, spec, what))
+                return solids[i]
+            if spec.startswith("near:"):
+                body = near(spec, pool)
+                if body is None:
+                    raise RuntimeError("no %s body matched %r" % (what, spec))
+                return body
+            if spec in ("largest", "biggest", "max"):
+                return max(pool, key=self.body_volume_mm3)
+            if spec in ("smallest", "min"):
+                return min(pool, key=self.body_volume_mm3)
+            if spec == "first":
+                return pool[0]
+            if spec == "last":
+                return pool[-1]
+            raise RuntimeError("bad %s %r (largest|smallest|first|last|#i|near:x,y,z)"
+                               % (what, spec))
+
+        main = pick(target, solids, "target")
+        if (tools or "all").strip().lower() == "all":
+            picked = [b for b in solids if b is not main]
+        else:
+            picked = [pick(tools, [b for b in solids if b is not main], "tool")]
+
+        def index_of(body):
+            for i, b in enumerate(solids):
+                if b is body:
+                    return i
+            return -1
+
+        def label(body):
+            name = val(body, "Name") or ""
+            i = index_of(body)
+            return name if name else "#%d" % i
+
+        before = self._feature_names(m)
+        vol_before = [self.body_volume_mm3(b) for b in solids]
+        main_label = label(main)
+        tool_labels = [label(b) for b in picked]
+        m.ClearSelection2(True)
+        for body in [main] + picked:
+            if not body.Select(True, 1):
+                raise RuntimeError("cannot select body %s" % val(body, "Name"))
+        arr = win32.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_DISPATCH, picked)
+        m.FeatureManager.InsertCombineFeature(COMBINE_OPS[key], main, arr)
+        name = self._created_feature(before, m, "combine (%s)" % key)
+        m.ClearSelection2(True)
+        return {
+            "ok": True, "feature": name, "operation": key,
+            "target": main_label, "target_volume_mm3": vol_before[index_of(main)],
+            "tools": tool_labels,
+            "volume_before_mm3": vol_before,
+            "volume_mm3": self.volume_mm3(m),
+            "solid_bodies": len(self.solid_bodies(m)),
+        }
 
     # -- edge / face selection ---------------------------------------------- #
     def edges(self, m=None, kind="all"):
@@ -941,6 +1073,10 @@ def cmd_extend_surface(b, a):
     return b.extend_surface(a.distance, edges=a.edges)
 
 
+def cmd_combine(b, a):
+    return b.combine(a.operation, target=a.target, tools=a.tools)
+
+
 def cmd_export(b, a):
     return b.export(a.out, a.format)
 
@@ -1084,6 +1220,12 @@ def build_parser():
     ext.add_argument("--distance", type=float, required=True)
     ext.add_argument("--edges", default="all")
 
+    cb = sub.add_parser("combine")
+    cb.add_argument("--operation", default="subtract",
+                    choices=["add", "subtract", "intersect"])
+    cb.add_argument("--target", default="largest")
+    cb.add_argument("--tools", default="all")
+
     ex = sub.add_parser("export")
     ex.add_argument("--out", required=True)
     ex.add_argument("--format", default=None)
@@ -1124,6 +1266,7 @@ COMMANDS = {
     "offset-surface": cmd_offset_surface,
     "sew": cmd_sew,
     "extend-surface": cmd_extend_surface,
+    "combine": cmd_combine,
 }
 
 

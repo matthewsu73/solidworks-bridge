@@ -91,6 +91,7 @@ $env:SW_PYTHON = "C:\Python312\python.exe"
 | `offset-surface --distance 5` | 等距偏移曲面，`--faces all\|near:x,y,z` |
 | `sew` | 缝合曲面体，`--tolerance 0.01` |
 | `extend-surface --distance 10` | 延伸曲面边，`--edges all\|near:...` |
+| `combine --operation subtract` | 实体布尔：`add\|subtract\|intersect`，`--target largest\|smallest\|#i\|near:x,y,z` |
 | `export --out out\x.step` | 导出 step / stl / igs / pdf |
 | `info` | 包围盒、体积、面积、质心、实体/曲面体数量、曲面面积、特征树 |
 | `rebuild` | 重建并回读体积 |
@@ -166,6 +167,28 @@ centerline x1 y1 x2 y2  构造线 / 旋转轴（旋转、旋转曲面用）
 选面统一用 `--faces all` 或 `--faces near:x,y,z`（毫米，取三角面片质心最接近的那个面），
 不依赖界面里点选。完整可运行脚本见 `examples\surface.ps1`。
 
+### 阳模 → 阴模（布尔求差）
+
+阴模的做法：先有 120×120×25 的料块，再把"阳模外表面 + 偏移/加厚"得到的实体从料块里减掉。
+
+```powershell
+# 1) 料块（不合并，保持独立实体）
+.\sw.cmd new --type part
+.\sw.cmd sketch --plane front --shapes "rect 0 0 120 120"
+.\sw.cmd extrude --depth 25
+
+# 2) 阳模曲面：surface-plane / surface-loft / offset-surface ...
+#    加厚成实体（自动成为第 2 个实体）
+.\sw.cmd thicken --thickness 3 --faces all
+
+# 3) 从料块里减掉型芯实体
+.\sw.cmd combine --operation subtract --target largest
+.\sw.cmd info      # volume_mm3 变小，solid_bodies 回到 1
+```
+
+`--operation add` 合并、`intersect` 取交集；`--target` 默认取体积最大的实体（料块），
+`--tools all` 表示减掉其余所有实体。要看是哪几个实体参与，先跑一次 `info`。
+
 ## 返回值怎么读
 
 ```jsonc
@@ -210,7 +233,10 @@ centerline x1 y1 x2 y2  构造线 / 旋转轴（旋转、旋转曲面用）
     要一起统计就各查一次再合并。
 11. **不少“创建特征”的 API 成功时返回 `None`**，不能拿返回值判成败；脚本改成比较调用前后
     特征树有没有新增项。
-12. **选面标记因命令而异**：加厚是 `Select2(True, 1)`，偏移曲面是 `Select2(True, 0)`，
+12. **布尔要传 VARIANT 数组**：`InsertCombineFeature(15902, commonBody, bodies)` 的第三个参数必须是
+    `VARIANT(VT_ARRAY | VT_DISPATCH, [...])`，直接传 Python list 会报"类型不匹配"；
+    而且第二个参数（保留实体）`None` 也不行，必须给 Body2。
+13. **选面标记因命令而异**：加厚是 `Select2(True, 1)`，偏移曲面是 `Select2(True, 0)`，
     缝合体是 `Body2.Select(True, 1)`。标错时可能不报错但什么都不生成。
 
 ## 限制
