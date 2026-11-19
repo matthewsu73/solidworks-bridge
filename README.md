@@ -92,6 +92,9 @@ $env:SW_PYTHON = "C:\Python312\python.exe"
 | `sew` | 缝合曲面体，`--tolerance 0.01` |
 | `extend-surface --distance 10` | 延伸曲面边，`--edges all\|near:...` |
 | `combine --operation subtract` | 实体布尔：`add\|subtract\|intersect`，`--target largest\|smallest\|#i\|near:x,y,z` |
+| `trim-surface --tool last --target first` | 裁剪曲面：用工具曲面体剪切目标曲面，`--mode standard\|mutual`、`--sew`；选不到面时换 `--tool-mark 4 --target-mark 1` |
+| `fill-surface --edges all` | 填充曲面：在封闭边线环上补曲面片 |
+| `boundary-surface --sketches 草图1,草图2` | 边界曲面：先放样再 `ConvertLoftOrSweepToNetBlend` 转网络面；也可 `--from-feature 曲面-放样1` 转换已有特征 |
 | `export --out out\x.step` | 导出 step / stl / igs / pdf |
 | `info` | 包围盒、体积、面积、质心、实体/曲面体数量、曲面面积、特征树 |
 | `rebuild` | 重建并回读体积 |
@@ -166,6 +169,23 @@ centerline x1 y1 x2 y2  构造线 / 旋转轴（旋转、旋转曲面用）
 
 选面统一用 `--faces all` 或 `--faces near:x,y,z`（毫米，取三角面片质心最接近的那个面），
 不依赖界面里点选。完整可运行脚本见 `examples\surface.ps1`。
+
+
+
+### 裁剪 / 填充 / 边界曲面
+
+```powershell
+.\sw.cmd trim-surface --tool last --target first --mode standard
+.\sw.cmd fill-surface --edges all
+.\sw.cmd boundary-surface --sketches 草图1,草图2
+.\sw.cmd boundary-surface --from-feature 曲面-放样1
+```
+
+- `trim-surface` 的两个体用 `--tool/-target` 选定：`first|last|#i|near:x,y,z|名称子串`。
+  SolidWorks 靠选择标记区分工具(默认 mark 1)与目标(默认 mark 4)；极少数版本相反，
+  报错时按提示交换 `--tool-mark/--target-mark` 即可。
+- `boundary-surface`：SW2025 的 API **没有**直接创建边界曲面的接口，本工具走官方等价路线
+  （放样→转为网络面）。曲面控制点/两方向曲线更细的调整，请在 SW 界面手工做，之后可由工具读取。
 
 ### 阳模 → 阴模（布尔求差）
 

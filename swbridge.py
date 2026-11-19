@@ -720,6 +720,150 @@ class Bridge:
             "solid_bodies": len(self.solid_bodies(m)),
         }
 
+# -- surface trim / fill / boundary ------------------------------------ #
+    def _select_body_by_name(self, body, append, mark, doc_type="SURFACEBODY"):
+        """Select a whole body through its name (avoids face-level ambiguity)."""
+        m = self.model
+        callout = win32.VARIANT(pythoncom.VT_DISPATCH, None)
+        return bool(m.Extension.SelectByID2(
+            val(body, "Name") or "", doc_type, 0.0, 0.0, 0.0,
+            append, mark, callout, 0))
+
+    @staticmethod
+    def _body_center_mm(body):
+        try:
+            box = list(val(body, "GetBodyBox"))
+        except Exception:
+            return None
+        if box is None or len(box) < 6:
+            return None
+        return [(box[i] + box[i + 3]) / 2.0 for i in range(3)]
+
+    def trim_surface(self, tool="last", target="first", mode="standard",
+                     sew=False, tool_mark=1, target_mark=4):
+        """Trim `target` surface body with a `tool` surface body (SW UI: trim surface).
+        SolidWorks distinguishes trim tool and target by selection marks; defaults
+        follow the UI convention (tool=1, target=4). Swap via tool-mark/target-mark."""
+        m = self.model
+        mode = (mode or "standard").strip().lower()
+        if mode not in ("standard", "mutual"):
+            raise RuntimeError("bad --mode %r (standard|mutual)" % mode)
+        surfaces = self.surface_bodies(m)
+        if len(surfaces) < 2:
+            raise RuntimeError(
+                "trim-surface needs at least two surface bodies, found %d"
+                % len(surfaces))
+
+        def pick(spec, default_i, what):
+            spec = (spec or "").strip().lower()
+            if spec.startswith("#"):
+                try:
+                    i = int(spec[1:])
+                except ValueError:
+                    raise RuntimeError("bad %s %r, use #index" % (what, spec))
+                if i < 0 or i >= len(surfaces):
+                    raise RuntimeError("%s index out of range: %s"
+                                       % (what, spec))
+                return surfaces[i]
+            if spec.startswith("near:"):
+                try:
+                    point = [float(x) * MM for x in spec[5:].split(",")[:3]]
+                except ValueError:
+                    raise RuntimeError("bad %s %r, use near:x,y,z" % (what, spec))
+                best, best_d = None, None
+                for body in surfaces:
+                    c = self._body_center_mm(body)
+                    if c is None:
+                        continue
+                    d = sum((c[k] - point[k]) ** 2 for k in range(3))
+                    if best_d is None or d < best_d:
+                        best_d, best = d, body
+                if best is None:
+                    raise RuntimeError("no %s body near %r" % (what, spec))
+                return best
+            if spec in ("first", "last"):
+                return surfaces[0 if spec == "first" else -1]
+            if spec in ("", "default"):
+                return surfaces[default_i]
+            for body in surfaces:
+                if spec in (val(body, "Name") or "").lower():
+                    return body
+            raise RuntimeError(
+                "no %s body matched %r (first|last|#i|near:x,y,z|name)"
+                % (what, spec))
+
+        tool_body = pick(tool, -1, "tool")
+        target_body = pick(target, 0, "target")
+        if tool_body is target_body:
+            raise RuntimeError("tool and target resolved to the same body")
+
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        self._select_body_by_name(tool_body, False, tool_mark)
+        self._select_body_by_name(target_body, True, target_mark)
+        if not m.PreTrimSurface(mode == "mutual"):
+            raise RuntimeError(
+                "PreTrimSurface rejected the selection - try swapping "
+                "--tool-mark/--target-mark")
+        m.PostTrimSurface(bool(sew))
+        name = self._created_feature(
+            before, m, "trim surface",
+            "no trim feature appeared - try swapped marks (--tool-mark %d "
+            "--target-mark %d)" % (target_mark, tool_mark))
+        m.ClearSelection2(True)
+        return {
+            "ok": True, "feature": name, "mode": mode,
+            "tool": val(tool_body, "Name"), "target": val(target_body, "Name"),
+            "surface_bodies": len(self.surface_bodies(m)),
+        }
+
+    def fill_surface(self, edges="all", resolution=1):
+        """Fill a patch surface on the selected closed edge loop (fill surface)."""
+        m = self.model
+        n = self.select_edges(edges)
+        if n == 0:
+            raise RuntimeError("no edges matched %r (all|near:x,y,z)" % edges)
+        before = self._feature_names(m)
+        m.FeatureManager.InsertFillSurface(int(resolution))
+        name = self._created_feature(
+            before, m, "fill surface",
+            "select a closed loop of edges/sketches")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name, "edges": n}
+
+    def boundary_surface(self, sketches=None, from_feature=None):
+        """Boundary surface: SW2025 API has no direct create call for boundary.
+
+        Supported equivalent: build a loft surface then convert it to a net
+        blend (boundary) feature via ConvertLoftOrSweepToNetBlend, or convert
+        an existing loft/sweep surface feature (--from-feature)."""
+        m = self.model
+        if from_feature:
+            loft_name = from_feature
+        else:
+            if not sketches or len(sketches) < 2:
+                raise RuntimeError(
+                    "boundary-surface needs --sketches s1,s2 (or more) "
+                    "or --from-feature <existing loft/sweep feature>")
+            loft_name = val(self.surface_loft(sketches), "feature")
+        m.ClearSelection2(True)
+        callout = win32.VARIANT(pythoncom.VT_DISPATCH, None)
+        ok = m.Extension.SelectByID2(
+            loft_name, "BODYFEATURE", 0.0, 0.0, 0.0, False, 1, callout, 0)
+        if not ok:
+            raise RuntimeError(
+                "cannot select feature %r for conversion (has it been "
+                "created already?)" % loft_name)
+        before = self._feature_names(m)
+        m.FeatureManager.ConvertLoftOrSweepToNetBlend()
+        name = self._created_feature(
+            before, m, "boundary surface",
+            "conversion produced no feature - verify the source is a "
+            "loft/sweep surface")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name, "from": loft_name,
+                "surface_bodies": len(self.surface_bodies(m))}
+
     # -- edge / face selection ---------------------------------------------- #
     def edges(self, m=None, kind="all"):
         out = []
@@ -1084,6 +1228,22 @@ def cmd_combine(b, a):
     return b.combine(a.operation, target=a.target, tools=a.tools)
 
 
+def cmd_trim_surface(b, a):
+    return b.trim_surface(tool=a.tool, target=a.target, mode=a.mode,
+                          sew=a.sew, tool_mark=a.tool_mark,
+                          target_mark=a.target_mark)
+
+
+def cmd_fill_surface(b, a):
+    return b.fill_surface(edges=a.edges, resolution=a.resolution)
+
+
+def cmd_boundary_surface(b, a):
+    sketches = [x.strip() for x in a.sketches.split(",") if x.strip()] \
+        if a.sketches else None
+    return b.boundary_surface(sketches=sketches, from_feature=a.from_feature)
+
+
 def cmd_export(b, a):
     return b.export(a.out, a.format)
 
@@ -1234,6 +1394,22 @@ def build_parser():
     cb.add_argument("--target", default="largest")
     cb.add_argument("--tools", default="all")
 
+    tse = sub.add_parser("trim-surface")
+    tse.add_argument("--tool", default="last")
+    tse.add_argument("--target", default="first")
+    tse.add_argument("--mode", default="standard", choices=["standard", "mutual"])
+    tse.add_argument("--sew", action="store_true")
+    tse.add_argument("--tool-mark", type=int, default=1)
+    tse.add_argument("--target-mark", type=int, default=4)
+
+    fsv = sub.add_parser("fill-surface")
+    fsv.add_argument("--edges", default="all")
+    fsv.add_argument("--resolution", type=int, default=1)
+
+    bfs = sub.add_parser("boundary-surface")
+    bfs.add_argument("--sketches", default=None)
+    bfs.add_argument("--from-feature", default=None)
+
     ex = sub.add_parser("export")
     ex.add_argument("--out", required=True)
     ex.add_argument("--format", default=None)
@@ -1275,6 +1451,9 @@ COMMANDS = {
     "sew": cmd_sew,
     "extend-surface": cmd_extend_surface,
     "combine": cmd_combine,
+    "trim-surface": cmd_trim_surface,
+    "fill-surface": cmd_fill_surface,
+    "boundary-surface": cmd_boundary_surface,
 }
 
 

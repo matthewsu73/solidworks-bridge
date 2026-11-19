@@ -1,6 +1,6 @@
 ---
 name: solidworks
-description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程图、草图、拉伸/切除/旋转、圆角/倒角、曲面拉伸/旋转/放样/扫描/延伸/偏移/缝合/加厚、导出 STEP/STL/IGES/PDF、读质量属性与包围盒。当用户要求"在 SolidWorks 里做个零件/改模型/出工程图/导出模型"时使用。
+description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程图、草图、拉伸/切除/旋转、圆角/倒角、曲面拉伸/旋转/放样/扫描/延伸/偏移/缝合/加厚/裁剪/填充/边界、导出 STEP/STL/IGES/PDF、读质量属性与包围盒。当用户要求"在 SolidWorks 里做个零件/改模型/出工程图/导出模型"时使用。
 ---
 
 # SolidWorks 接入（本机 SW2025 COM 自动化）
@@ -51,6 +51,9 @@ description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程
 | 缝合曲面 | `sew --tolerance 0.01` |
 | 延伸曲面 | `extend-surface --distance 10 --edges all` |
 | 实体布尔 | `combine --operation subtract`（`add|subtract|intersect`，`--target largest|smallest|#i|near:x,y,z`，`--tools all|...`） |
+| 裁剪曲面 | `trim-surface --tool last --target first --mode standard|mutual [--sew] [--tool-mark N --target-mark M]`（选体: first|last|#i|near:x,y,z|名称子串；SW 默认工具 mark 1、目标 mark 4） |
+| 填充曲面 | `fill-surface --edges all|near:x,y,z --resolution 1`（封闭边线环补面） |
+| 边界曲面 | `boundary-surface --sketches 草图1,草图2` 或 `--from-feature 曲面-放样1`（API 无直接入口，放样→ConvertLoftOrSweepToNetBlend 转网络面） |
 
 ### 草图 DSL（`--shapes`，分号或换行分隔，全为 mm）
 
@@ -184,7 +187,7 @@ centerline x1 y1 x2 y2            构造线/旋转轴（旋转、旋转曲面必
 ## 已知限制
 
 - 目前没有装配体配合、工程图视图、方程式/配置驱动这些高层命令；要这些用 `exec` 或告诉开发者补命令。
-- 曲面裁剪（剪裁曲面 / `PreTrimSurface`）暂未封装，需要时在界面里做或用 `exec` 试；
-  也没有边界曲面（Boundary Surface）。
+- 曲面裁剪已封装为 `trim-surface`，边界曲面走 `boundary-surface`（放样转网络面）；
+  SW2025 API 没有直接创建边界曲面的入口，两方向曲线/控制点的精细调节仍需界面手工做。
 - 选面只有 `all` 和 `near:x,y,z`，没有按面索引/名称选择；选边可按几何特征。
 - UI 是中文界面，特征名会是 `凸台-拉伸1`、`切除-拉伸1`、`圆角1` 这类；按名字引用时用 `--sketch 草图2` 这种前缀即可。
