@@ -39,7 +39,9 @@ DOC_PART, DOC_ASSEMBLY, DOC_DRAWING = 1, 2, 3
 DOC_NAME = {1: "part", 2: "assembly", 3: "drawing"}
 
 END_BLIND, END_THROUGH_ALL, END_MID_PLANE = 0, 1, 6
-SW_SOLID_BODY = 0  # swBodyType_e.swAllBodies
+SW_SOLID_BODY = 0    # GetBodies2(0) -> solid bodies (verified SW2025)
+SW_SURFACE_BODY = 1  # GetBodies2(1) -> surface / sheet bodies (verified SW2025)
+BODY_KINDS = {"solid": SW_SOLID_BODY, "surface": SW_SURFACE_BODY}
 SW_START_SKETCH_PLANE = 0
 FILLET_UNIFORM = 2  # empirically required by FeatureFillet3 in SW2025
 
@@ -152,21 +154,61 @@ class Bridge:
             "features": [val(f, "Name") for f in self.features(m)],
         }
 
-    def bodies(self, m=None):
+    def bodies(self, m=None, kind="all"):
+        """Bodies in the active part.
+
+        kind: all | solid | surface. SolidWorks stores solid and sheet bodies in
+        separate collections, so both have to be queried and merged.
+        """
         m = m or self.model
-        b = m.GetBodies2(SW_SOLID_BODY, False)
-        if b is None:
-            return []
-        if not isinstance(b, (tuple, list)):
-            b = [b]
-        return list(b)
+        if kind == "all":
+            types = [SW_SOLID_BODY, SW_SURFACE_BODY]
+        else:
+            try:
+                types = [BODY_KINDS[kind]]
+            except KeyError:
+                raise RuntimeError("unknown body kind: %s (all|solid|surface)" % kind)
+        out = []
+        for t in types:
+            raw = m.GetBodies2(t, False)
+            if raw is None:
+                continue
+            if not isinstance(raw, (tuple, list)):
+                raw = [raw]
+            out.extend(raw)
+        return out
+
+    def body_kind(self, body):
+        try:
+            return "surface" if int(val(body, "GetType")) == SW_SURFACE_BODY else "solid"
+        except Exception:
+            return "unknown"
+
+    def solid_bodies(self, m=None):
+        return self.bodies(m, "solid")
+
+    def surface_bodies(self, m=None):
+        return self.bodies(m, "surface")
 
     def volume_mm3(self, m=None):
-        bodies = self.bodies(m)
-        if not bodies:
+        solids = self.solid_bodies(m)
+        if not solids:
             return None
-        mp = bodies[0].GetMassProperties(1000.0)
-        return round(float(mp[3]) * 1e9, 2)
+        total = 0.0
+        for body in solids:
+            total += float(body.GetMassProperties(1000.0)[3])
+        return round(total * 1e9, 2)
+
+    def surface_area_mm2(self, m=None, kind="surface"):
+        """Area from IFace2.GetArea (m^2) summed over faces, in mm^2.
+
+        GetMassProperties() is not meaningful for open sheet bodies; this is.
+        """
+        total = 0.0
+        for body in self.bodies(m, kind):
+            for face in body.GetFaces():
+                total += float(face.GetArea)
+        return round(total * 1e6, 2)
 
     def exact_bbox(self, m=None):
         """Bounding box measured from tessellated faces, in mm.
@@ -199,22 +241,35 @@ class Bridge:
         }
 
     # -- sketching ---------------------------------------------------------- #
-    def start_sketch(self, plane):
+    def find_plane(self, plane):
+        """front|top|right by position, otherwise fuzzy name match."""
         m = self.model
         planes = self.planes(m)
         key = str(plane).lower()
         index = {"front": 0, "top": 1, "right": 2}.get(key)
-        target = None
         if index is not None and len(planes) > index:
-            target = planes[index]
-        else:
-            for f in self.features(m):
-                name = val(f, "Name")
-                if name and key in name.lower():
-                    target = f
-                    break
-        if target is None:
-            raise RuntimeError("plane not found: %s" % plane)
+            return planes[index]
+        for f in self.features(m):
+            name = val(f, "Name")
+            if name and key in name.lower():
+                return f
+        raise RuntimeError("plane not found: %s" % plane)
+
+    def plane_offset(self, base="front", distance=10.0):
+        m = self.model
+        target = self.find_plane(base)
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        if not target.Select2(False, 0):
+            raise RuntimeError("cannot select plane %s" % val(target, "Name"))
+        m.CreatePlaneAtOffset3(distance * MM, False, True)
+        name = self._created_feature(before, m, "offset plane")
+        m.ClearSelection2(True)
+        return {"ok": True, "plane": name, "base": val(target, "Name")}
+
+    def start_sketch(self, plane):
+        m = self.model
+        target = self.find_plane(plane)
         m.ClearSelection2(True)
         if not target.Select2(False, 0):
             raise RuntimeError("cannot select plane %s" % val(target, "Name"))
@@ -244,6 +299,9 @@ class Bridge:
                 elif kind == "line":
                     skm.CreateLine(num[0] * MM, num[1] * MM, 0,
                                    num[2] * MM, num[3] * MM, 0)
+                elif kind == "centerline":
+                    skm.CreateCenterLine(num[0] * MM, num[1] * MM, 0,
+                                         num[2] * MM, num[3] * MM, 0)
                 elif kind == "polygon":
                     cx, cy, r, n = num[0], num[1], num[2], int(num[3])
                     rot = math.radians(num[4] if len(num) > 4 else 0)
@@ -361,10 +419,173 @@ class Bridge:
             raise RuntimeError("revolve failed - the sketch needs a centreline/axis")
         return {"ok": True, "feature": val(feat, "Name")}
 
-    # -- edge selection ----------------------------------------------------- #
-    def edges(self, m=None):
+    # -- surfaces (all verified on SOLIDWORKS 2025) ------------------------- #
+    def _feature_names(self, m=None):
+        return [val(f, "Name") for f in self.features(m)]
+
+    def _created_feature(self, before, m=None, what="feature", hint=""):
+        """Rebuild and return the newest feature, failing if none appeared.
+
+        InsertSweepSurface3 / InsertOffsetSurface / InsertExtendSurface /
+        InsertSewRefSurface return None on success, so the feature tree is the
+        only reliable success signal.
+        """
+        m = m or self.model
+        val(m, "EditRebuild3")
+        names = self._feature_names(m)
+        if len(names) <= len(before):
+            msg = "%s failed - no feature was created" % what
+            if hint:
+                msg += " (" + hint + ")"
+            raise RuntimeError(msg)
+        return names[-1]
+
+    def surface_plane(self, sketch=None):
+        m = self.model
+        sk = self.sketch_feature(sketch)
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        if not sk.Select2(False, 0):
+            raise RuntimeError("cannot select sketch %s" % val(sk, "Name"))
+        val(m, "InsertPlanarRefSurface")
+        name = self._created_feature(before, m, "planar surface")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name}
+
+    def surface_extrude(self, depth, flip=False, sketch=None):
+        m = self.model
+        sk = self.sketch_feature(sketch)
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        if not sk.Select2(False, 0):
+            raise RuntimeError("cannot select sketch %s" % val(sk, "Name"))
+        m.FeatureManager.FeatureExtruRefSurface3(
+            True, flip, 0, 0.0, 0, 0, depth * MM, 0.0,
+            False, False, False, False, 0.0, 0.0,
+            False, False, False, False, False, False, True, False)
+        name = self._created_feature(before, m, "surface extrude")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name}
+
+    def surface_revolve(self, angle=360.0, sketch=None, flip=False):
+        m = self.model
+        sk = self.sketch_feature(sketch)
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        if not sk.Select2(False, 0):
+            raise RuntimeError("cannot select sketch %s" % val(sk, "Name"))
+        m.FeatureManager.FeatureRevolve2(
+            True, False, False, False, flip, False,
+            0, 0, math.radians(angle), 0.0,
+            False, False, 0.0, 0.0,
+            0, 0.0, 0.0,
+            True, False, False)
+        name = self._created_feature(
+            before, m, "surface revolve",
+            "check the sketch has a centreline and the profile does not sit on it")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name}
+
+    def surface_loft(self, sketches):
+        m = self.model
+        if len(sketches) < 2:
+            raise RuntimeError("surface-loft needs at least two sketches")
+        feats = [self.sketch_feature(name) for name in sketches]
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        for f in feats:
+            if not f.Select2(True, 1):
+                raise RuntimeError("cannot select sketch %s" % val(f, "Name"))
+        m.InsertLoftRefSurface2(False, False, False, 0.0, 0, 0)
+        name = self._created_feature(before, m, "surface loft")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name, "sketches": len(feats)}
+
+    def surface_sweep(self, outline, path):
+        m = self.model
+        outline_sk = self.sketch_feature(outline)
+        path_sk = self.sketch_feature(path)
+        before = self._feature_names(m)
+        m.ClearSelection2(True)
+        # Outline takes mark 1, path takes mark 4 (verified on SW2025; the
+        # reverse order creates a feature with the wrong geometry).
+        if not outline_sk.Select2(True, 1):
+            raise RuntimeError("cannot select outline sketch %s" % val(outline_sk, "Name"))
+        if not path_sk.Select2(True, 4):
+            raise RuntimeError("cannot select path sketch %s" % val(path_sk, "Name"))
+        m.FeatureManager.InsertSweepSurface3(
+            False, 0, False, True, 0, 0, 0,
+            True, True, 0.0, False, False, 0.0, False)
+        name = self._created_feature(
+            before, m, "surface sweep",
+            "the path must cross the profile plane, e.g. a line on the top plane going along Z")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name}
+
+    def thicken(self, thickness, faces="all"):
+        m = self.model
+        before = self._feature_names(m)
+        n = self.select_faces(faces, kind="surface", mark=1)
+        if n == 0:
+            raise RuntimeError("no surface faces matched %r" % faces)
+        m.FeatureManager.FeatureBossThicken(
+            thickness * MM, 0, 0, False, True, False, False)
+        name = self._created_feature(before, m, "thicken")
+        m.ClearSelection2(True)
+        return {
+            "ok": True, "feature": name, "faces": n,
+            "volume_mm3": self.volume_mm3(m),
+            "solid_bodies": len(self.solid_bodies(m)),
+        }
+
+    def offset_surface(self, distance, faces="all"):
+        m = self.model
+        before = self._feature_names(m)
+        n = self.select_faces(faces, kind="surface", mark=0)
+        if n == 0:
+            raise RuntimeError("no surface faces matched %r" % faces)
+        m.InsertOffsetSurface(distance * MM, False)
+        name = self._created_feature(before, m, "offset surface")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name, "faces": n}
+
+    def sew(self, bodies="surface", tolerance=0.01):
+        m = self.model
+        targets = self.bodies(m, bodies)
+        if not targets:
+            raise RuntimeError("no %s bodies to sew" % bodies)
+        before = self._feature_names(m)
+        before_bodies = len(self.bodies(m))
+        m.ClearSelection2(True)
+        for body in targets:
+            if not body.Select(True, 1):
+                raise RuntimeError("cannot select body %s" % val(body, "Name"))
+        m.FeatureManager.InsertSewRefSurface(
+            False, False, True, tolerance * MM, 0.0)
+        name = self._created_feature(before, m, "sew")
+        m.ClearSelection2(True)
+        return {
+            "ok": True, "feature": name, "sewn": len(targets),
+            "bodies_before": before_bodies,
+            "bodies_after": len(self.bodies(m)),
+            "surface_bodies": len(self.surface_bodies(m)),
+        }
+
+    def extend_surface(self, distance, edges="all"):
+        m = self.model
+        before = self._feature_names(m)
+        n = self.select_edges(edges, kind="surface")
+        if n == 0:
+            raise RuntimeError("no surface edges matched %r" % edges)
+        m.InsertExtendSurface(True, 0, distance * MM)
+        name = self._created_feature(before, m, "extend surface")
+        m.ClearSelection2(True)
+        return {"ok": True, "feature": name, "edges": n}
+
+    # -- edge / face selection ---------------------------------------------- #
+    def edges(self, m=None, kind="all"):
         out = []
-        for body in self.bodies(m):
+        for body in self.bodies(m, kind):
             got = body.GetEdges()
             if got:
                 out.extend(got)
@@ -377,7 +598,7 @@ class Bridge:
         p2 = list(val(v2, "GetPoint")) if v2 is not None else None
         return p1, p2
 
-    def select_edges(self, spec="all"):
+    def select_edges(self, spec="all", kind="all"):
         """spec: all | vertical | horizontal | circular | near:x,y,z;x,y,z"""
         m = self.model
         spec = (spec or "all").strip().lower()
@@ -392,7 +613,7 @@ class Bridge:
                     continue
                 c = [float(x) for x in chunk.split(",")]
                 points.append([v * MM for v in c])
-        for edge in self.edges(m):
+        for edge in self.edges(m, kind):
             p1, p2 = self.edge_points(edge)
             keep = True
             if points is not None:
@@ -418,6 +639,66 @@ class Bridge:
                     ratio = dz / length if length > 1e-9 else 0
                     keep = ratio > 0.98 if spec == "vertical" else ratio < 0.02
             if keep and edge.Select2(True, 0):
+                count += 1
+        return count
+
+    def faces(self, m=None, kind="all"):
+        out = []
+        for body in self.bodies(m, kind):
+            got = body.GetFaces()
+            if got:
+                out.extend(got)
+        return out
+
+    def face_center_mm(self, face):
+        """Mean of the face's tessellation vertices, in mm."""
+        data = face.GetTessTriangles(True)
+        if not data:
+            return None
+        n = 0
+        acc = [0.0, 0.0, 0.0]
+        for i in range(0, len(data) - 2, 3):
+            for k in range(3):
+                acc[k] += float(data[i + k]) * 1000.0
+            n += 1
+        return [v / n for v in acc]
+
+    def select_faces(self, spec="all", kind="surface", mark=1):
+        """spec: all | near:x,y,z (mm).
+
+        near: picks the single face whose tessellation centroid is closest to
+        the given point - the practical way to pick a face without a UI.
+        """
+        m = self.model
+        spec = (spec or "all").strip().lower()
+        m.ClearSelection2(True)
+        candidates = self.faces(m, kind)
+        chosen = []
+        if spec.startswith("near:"):
+            try:
+                target = [float(x) * MM for x in spec[5:].split(",")[:3]]
+            except ValueError:
+                raise RuntimeError("bad face point %r, use near:x,y,z" % spec)
+            if len(target) != 3:
+                raise RuntimeError("bad face point %r, use near:x,y,z" % spec)
+            best = None
+            best_d = None
+            for face in candidates:
+                c = self.face_center_mm(face)
+                if c is None:
+                    continue
+                d = sum((c[i] - target[i]) ** 2 for i in range(3))
+                if best_d is None or d < best_d:
+                    best_d, best = d, face
+            if best is not None:
+                chosen = [best]
+        elif spec == "all":
+            chosen = candidates
+        else:
+            raise RuntimeError("unknown --faces spec: %s (all | near:x,y,z)" % spec)
+        count = 0
+        for face in chosen:
+            if face.Select2(True, mark):
                 count += 1
         return count
 
@@ -484,10 +765,16 @@ class Bridge:
                 out["bbox_mm_exact"] = exact
         except Exception:
             pass
-        bodies = self.bodies(m)
-        out["bodies"] = len(bodies)
-        if bodies:
-            mp = bodies[0].GetMassProperties(1000.0)
+        all_bodies = self.bodies(m)
+        solids = [b for b in all_bodies if self.body_kind(b) == "solid"]
+        surfaces = [b for b in all_bodies if self.body_kind(b) == "surface"]
+        out["bodies"] = len(all_bodies)
+        out["solid_bodies"] = len(solids)
+        out["surface_bodies"] = len(surfaces)
+        if surfaces:
+            out["surface_area_mm2"] = self.surface_area_mm2(m, "surface")
+        if solids:
+            mp = solids[0].GetMassProperties(1000.0)
             out["mass_properties"] = {
                 "volume_mm3": round(float(mp[3]) * 1e9, 2),
                 "area_mm2": round(float(mp[4]) * 1e6, 2),
@@ -613,6 +900,47 @@ def cmd_chamfer(b, a):
     return b.chamfer(a.distance, a.angle, edges=a.edges)
 
 
+def cmd_plane_offset(b, a):
+    return b.plane_offset(a.base, a.distance)
+
+
+def cmd_surface_plane(b, a):
+    return b.surface_plane(sketch=a.sketch)
+
+
+def cmd_surface_extrude(b, a):
+    return b.surface_extrude(a.depth, flip=a.flip, sketch=a.sketch)
+
+
+def cmd_surface_revolve(b, a):
+    return b.surface_revolve(a.angle, sketch=a.sketch, flip=a.flip)
+
+
+def cmd_surface_loft(b, a):
+    names = [x.strip() for x in a.sketches.split(",") if x.strip()]
+    return b.surface_loft(names)
+
+
+def cmd_surface_sweep(b, a):
+    return b.surface_sweep(a.outline, a.path)
+
+
+def cmd_thicken(b, a):
+    return b.thicken(a.thickness, faces=a.faces)
+
+
+def cmd_offset_surface(b, a):
+    return b.offset_surface(a.distance, faces=a.faces)
+
+
+def cmd_sew(b, a):
+    return b.sew(bodies=a.bodies, tolerance=a.tolerance)
+
+
+def cmd_extend_surface(b, a):
+    return b.extend_surface(a.distance, edges=a.edges)
+
+
 def cmd_export(b, a):
     return b.export(a.out, a.format)
 
@@ -716,6 +1044,46 @@ def build_parser():
     ch.add_argument("--angle", type=float, default=45.0)
     ch.add_argument("--edges", default="vertical")
 
+    po = sub.add_parser("plane-offset")
+    po.add_argument("--base", default="front")
+    po.add_argument("--distance", type=float, required=True)
+
+    sp = sub.add_parser("surface-plane")
+    sp.add_argument("--sketch", default=None)
+
+    sx = sub.add_parser("surface-extrude")
+    sx.add_argument("--depth", type=float, required=True)
+    sx.add_argument("--sketch", default=None)
+    sx.add_argument("--flip", action="store_true")
+
+    sr = sub.add_parser("surface-revolve")
+    sr.add_argument("--angle", type=float, default=360.0)
+    sr.add_argument("--sketch", default=None)
+    sr.add_argument("--flip", action="store_true")
+
+    sl = sub.add_parser("surface-loft")
+    sl.add_argument("--sketches", required=True)
+
+    swp = sub.add_parser("surface-sweep")
+    swp.add_argument("--outline", required=True)
+    swp.add_argument("--path", required=True)
+
+    th = sub.add_parser("thicken")
+    th.add_argument("--thickness", type=float, required=True)
+    th.add_argument("--faces", default="all")
+
+    ofs = sub.add_parser("offset-surface")
+    ofs.add_argument("--distance", type=float, required=True)
+    ofs.add_argument("--faces", default="all")
+
+    sew = sub.add_parser("sew")
+    sew.add_argument("--bodies", default="surface", choices=["surface", "solid", "all"])
+    sew.add_argument("--tolerance", type=float, default=0.01)
+
+    ext = sub.add_parser("extend-surface")
+    ext.add_argument("--distance", type=float, required=True)
+    ext.add_argument("--edges", default="all")
+
     ex = sub.add_parser("export")
     ex.add_argument("--out", required=True)
     ex.add_argument("--format", default=None)
@@ -746,6 +1114,16 @@ COMMANDS = {
     "chamfer": cmd_chamfer, "export": cmd_export, "info": cmd_info,
     "rebuild": cmd_rebuild, "screenshot": cmd_screenshot, "macro": cmd_macro,
     "exec": cmd_exec,
+    "plane-offset": cmd_plane_offset,
+    "surface-plane": cmd_surface_plane,
+    "surface-extrude": cmd_surface_extrude,
+    "surface-revolve": cmd_surface_revolve,
+    "surface-loft": cmd_surface_loft,
+    "surface-sweep": cmd_surface_sweep,
+    "thicken": cmd_thicken,
+    "offset-surface": cmd_offset_surface,
+    "sew": cmd_sew,
+    "extend-surface": cmd_extend_surface,
 }
 
 

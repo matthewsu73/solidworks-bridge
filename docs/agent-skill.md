@@ -1,6 +1,6 @@
 ---
 name: solidworks
-description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程图、草图、拉伸/切除/旋转、圆角/倒角、导出 STEP/STL/IGES/PDF、读质量属性与包围盒。当用户要求"在 SolidWorks 里做个零件/改模型/出工程图/导出模型"时使用。
+description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程图、草图、拉伸/切除/旋转、圆角/倒角、曲面拉伸/旋转/放样/扫描/延伸/偏移/缝合/加厚、导出 STEP/STL/IGES/PDF、读质量属性与包围盒。当用户要求"在 SolidWorks 里做个零件/改模型/出工程图/导出模型"时使用。
 ---
 
 # SolidWorks 接入（本机 SW2025 COM 自动化）
@@ -40,6 +40,16 @@ description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程
 | 截图 | `screenshot --out "out\view.bmp"` |
 | 跑 VBA 宏 | `macro "C:\path\m.swp"` |
 | 任意 COM 代码兜底 | `exec --code "..."`（预置 `sw`、`model`、`bridge`、`MM`、`val`） |
+| 偏移基准面 | `plane-offset --base front --distance 40`（返回名字，如 `基准面1`，可直接给 `--plane`） |
+| 平面区域曲面 | `surface-plane` |
+| 拉伸曲面 | `surface-extrude --depth 25`（开口薄壳，不是实体） |
+| 旋转曲面 | `surface-revolve --angle 360`（草图里要有 `centerline`） |
+| 放样曲面 | `surface-loft --sketches 草图1,草图2` |
+| 扫描曲面 | `surface-sweep --outline 草图1 --path 草图2` |
+| 加厚成实体 | `thicken --thickness 3 --faces all|near:x,y,z` |
+| 偏移曲面 | `offset-surface --distance 5 --faces all|near:x,y,z` |
+| 缝合曲面 | `sew --tolerance 0.01` |
+| 延伸曲面 | `extend-surface --distance 10 --edges all` |
 
 ### 草图 DSL（`--shapes`，分号或换行分隔，全为 mm）
 
@@ -49,6 +59,7 @@ circle cx cy r            圆心 + 半径
 line x1 y1 x2 y2
 polygon cx cy r n [rot]   正 n 边形
 slot cx cy length width [angle]   槽（三条线近似）
+centerline x1 y1 x2 y2            构造线/旋转轴（旋转、旋转曲面必需）
 ```
 
 `--shapes-file file.txt` 可从文件读；`--plane` 支持 `front|top|right`，也支持按名字模糊匹配（界面是中文时就是 `前视基准面` 等，脚本按"第 1/2/3 个基准面"定位，不受语言影响）。
@@ -63,6 +74,56 @@ slot cx cy length width [angle]   槽（三条线近似）
 - `all` — 全部边
 - `near:30,20,5;0,0,0` — 按坐标点就近选边（mm）
 
+## 曲面
+
+实体（solid）和曲面体（sheet）在 SOLIDWORKS 里是两个集合，**互不包含**：
+`GetBodies2(0)` 只有实体，`GetBodies2(1)` 才有曲面。`info` 会给出
+`solid_bodies`、`surface_bodies`，有曲面时还有 `surface_area_mm2`（逐面
+`IFace2.GetArea` 累加，mm²）。开放曲面没有体积，`volume_mm3` 只算实体。
+
+### 拉伸曲面 → 加厚成实体
+
+```powershell
+.\sw.cmd new --type part
+.\sw.cmd sketch --plane front --shapes "rect 0 0 60 40"
+.\sw.cmd surface-extrude --depth 25      # surface_area_mm2 = 5000
+.\sw.cmd thicken --thickness 3 --faces all   # volume_mm3 = 15900
+```
+
+### 放样曲面（两个截面 + 偏移基准面）
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "rect 0 0 60 40"
+.\sw.cmd plane-offset --base front --distance 40    # -> "plane": "基准面1"
+.\sw.cmd sketch --plane 基准面1 --shapes "circle 0 0 15"
+.\sw.cmd surface-loft --sketches 草图1,草图2       # bbox 60x40x40
+```
+
+### 扫描曲面
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "circle 0 0 5"
+.\sw.cmd sketch --plane right --shapes "line 0 0 40 0"
+.\sw.cmd surface-sweep --outline 草图1 --path 草图2  # bbox 10x10x40
+```
+
+`surface-sweep` 内部固定：轮廓草图 `Select2(True, 1)`、路径草图 `Select2(True, 4)`。
+顺序反了可能“成功”但几何错误；路径还必须穿过轮廓所在平面。
+
+### 平面曲面 → 延伸 / 偏移 / 缝合
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "rect 0 0 60 40"
+.\sw.cmd surface-plane
+.\sw.cmd extend-surface --distance 10 --edges all   # 2400 -> 4800 mm2
+.\sw.cmd offset-surface --distance 5 --faces near:0,0,0
+.\sw.cmd sew                                        # 两个曲面体 → 一个
+```
+
+**选面不用点界面**：`--faces all` 全选，`--faces near:x,y,z`（mm）取三角面片质心
+最接近该点的单个面。加厚用 mark 1、偏移曲面用 mark 0、缝合体用 `Body2.Select(True, 1)`，
+这些标记已在 SW2025 上验证。
+
 ## 标准工作流
 
 1. `new --type part`
@@ -73,11 +134,15 @@ slot cx cy length width [angle]   槽（三条线近似）
 
 每步都会返回 `"ok": true/false`，失败时带 `error`。**每次改完都用 `info` 核对 `bbox_mm.size` 和 `volume_mm3` 是否符合预期**，不要凭"命令没报错"就下结论。
 
-## 三个真实坑（已在 SW2025 上验证过）
+## 几个真实坑（已在 SW2025 上验证过）
 
 1. **切除方向**：草图在前视基准面上、实体往 +Z 拉伸时，`cut` 默认朝 -Z 会切空，返回 `cut failed`。加 `--dir`（或 `--flip`）朝实体那一侧切。
 2. **圆角参数**：内部 `FeatureFillet3` 的 Options 必须是 `2`，边上要先选中；`--edges vertical` 已封装好。
 3. **零参数方法是属性**：SolidWorks 的 IDispatch 把 `GetTitle`/`EditRebuild3`/`GetStartVertex` 这类零参方法暴露成属性，直接 `obj.Method()` 会报"找不到成员"。脚本里的 `val(obj, "Name")` 已统一处理，写 `exec` 兜底代码时也要用它。
+4. **创建特征的 API 常返回 `None`**：成功与否要看特征树有没有新增项，
+   不能凭返回值判断。
+5. **选面标记因命令而异**：加厚 `1`、偏移曲面 `0`、缝合体 `1`；标错时
+   往往不报错也不生成特征。
 
 ## 自定义/扩展
 
@@ -91,5 +156,7 @@ slot cx cy length width [angle]   槽（三条线近似）
 ## 已知限制
 
 - 目前没有装配体配合、工程图视图、方程式/配置驱动这些高层命令；要这些用 `exec` 或告诉开发者补命令。
-- 曲面上选面/选边只支持边，不支持按面选。
+- 曲面裁剪（剪裁曲面 / `PreTrimSurface`）暂未封装，需要时在界面里做或用 `exec` 试；
+  也没有边界曲面（Boundary Surface）。
+- 选面只有 `all` 和 `near:x,y,z`，没有按面索引/名称选择；选边可按几何特征。
 - UI 是中文界面，特征名会是 `凸台-拉伸1`、`切除-拉伸1`、`圆角1` 这类；按名字引用时用 `--sketch 草图2` 这种前缀即可。

@@ -81,8 +81,18 @@ $env:SW_PYTHON = "C:\Python312\python.exe"
 | `revolve --angle 360` | 旋转（草图里要有中心线/轴线） |
 | `fillet --radius 3 --edges vertical` | 圆角 |
 | `chamfer --distance 1 --edges vertical` | 倒角 |
+| `plane-offset --base front --distance 40` | 建偏移基准面，返回名字（如 `基准面1`）可直接给 `--plane` |
+| `surface-plane` | 用草图生成平面区域曲面 |
+| `surface-extrude --depth 25` | 拉伸曲面（开口薄壳，不是实体） |
+| `surface-revolve --angle 360` | 旋转曲面（草图里要有中心线） |
+| `surface-loft --sketches 草图1,草图2` | 放样曲面 |
+| `surface-sweep --outline 草图1 --path 草图2` | 扫描曲面 |
+| `thicken --thickness 3` | 曲面加厚成实体，`--faces all\|near:x,y,z` |
+| `offset-surface --distance 5` | 等距偏移曲面，`--faces all\|near:x,y,z` |
+| `sew` | 缝合曲面体，`--tolerance 0.01` |
+| `extend-surface --distance 10` | 延伸曲面边，`--edges all\|near:...` |
 | `export --out out\x.step` | 导出 step / stl / igs / pdf |
-| `info` | 包围盒、体积、面积、质心、实体数、特征树 |
+| `info` | 包围盒、体积、面积、质心、实体/曲面体数量、曲面面积、特征树 |
 | `rebuild` | 重建并回读体积 |
 | `screenshot --out out\v.bmp` | 存视图截图 |
 | `macro <path> [--module --method]` | 跑已有 VBA 宏 |
@@ -98,12 +108,63 @@ circle  cx cy r
 line    x1 y1 x2 y2
 polygon cx cy r n [rot]
 slot    cx cy length width [angle]
+centerline x1 y1 x2 y2  构造线 / 旋转轴（旋转、旋转曲面用）
 ```
 
 ### 选边（圆角 / 倒角）
 
 `vertical`（平行 Z 轴的边，板类零件最常用）、`horizontal`、`circular`（圆/相切边）、
 `all`、`near:30,20,5;0,0,0`（按坐标就近，毫米）。
+
+## 曲面建模
+
+曲面体（sheet body）和实体（solid body）在 SOLIDWORKS 里是两个独立集合。`info` 会分别报
+`solid_bodies` / `surface_bodies`；开放曲面没有有意义的体积，所以面积改用
+`IFace2.GetArea` 逐面累加得到 `surface_area_mm2`，`volume_mm3` 只统计实体。
+
+### 拉伸曲面 + 加厚（做成实体）
+
+```powershell
+.\sw.cmd new --type part
+.\sw.cmd sketch --plane front --shapes "rect 0 0 60 40"
+.\sw.cmd surface-extrude --depth 25
+.\sw.cmd info            # surface_bodies 1, surface_area_mm2 5000
+.\sw.cmd thicken --thickness 3 --faces all
+.\sw.cmd info            # solid_bodies 1, volume_mm3 15900
+```
+
+### 放样曲面（需要偏移基准面）
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "rect 0 0 60 40"
+.\sw.cmd plane-offset --base front --distance 40     # 返回 "plane": "基准面1"
+.\sw.cmd sketch --plane 基准面1 --shapes "circle 0 0 15"
+.\sw.cmd surface-loft --sketches 草图1,草图2        # bbox 60x40x40
+```
+
+### 扫描曲面
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "circle 0 0 5"
+.\sw.cmd sketch --plane right --shapes "line 0 0 40 0"
+.\sw.cmd surface-sweep --outline 草图1 --path 草图2  # bbox 10x10x40
+```
+
+轮廓和路径的选择标记是固定的（轮廓 mark 1、路径 mark 4），写反了会“成功”但几何是错的；
+路径还必须与轮廓所在平面相交。
+
+### 平面曲面 + 延伸 / 偏移 / 缝合
+
+```powershell
+.\sw.cmd sketch --plane front --shapes "rect 0 0 60 40"
+.\sw.cmd surface-plane
+.\sw.cmd extend-surface --distance 10 --edges all    # 2400 -> 4800 mm2
+.\sw.cmd offset-surface --distance 5 --faces near:0,0,0
+.\sw.cmd sew                                         # 两个曲面体合成一个
+```
+
+选面统一用 `--faces all` 或 `--faces near:x,y,z`（毫米，取三角面片质心最接近的那个面），
+不依赖界面里点选。完整可运行脚本见 `examples\surface.ps1`。
 
 ## 返回值怎么读
 
@@ -113,6 +174,8 @@ slot    cx cy length width [angle]
   "bbox_mm":       { "min": [...], "max": [...], "size": [...] },  // API 值，曲面上会偏大
   "bbox_mm_exact": { "min": [...], "max": [...], "size": [...] },  // 三角面片实测，可信
   "bodies": 1,
+  "solid_bodies": 1,
+  "surface_bodies": 0,          // 有曲面体时才会出现 surface_area_mm2
   "mass_properties": { "volume_mm3": 316526.79, "area_mm2": 42299.95, ... }
 }
 ```
@@ -143,13 +206,22 @@ slot    cx cy length width [angle]
 8. **Windows 控制台默认不是 UTF-8**，中文特征名会变乱码并让 JSON 失效；脚本已强制
    `reconfigure(encoding="utf-8")`。
 9. **`GetBodyBox` / `GetPartBox` 对曲面是近似值**，别拿它判断零件是否超料，用三角面片。
+10. **实体和曲面体是两个集合**：`GetBodies2(0)` 只给实体，`GetBodies2(1)` 才给曲面，
+    要一起统计就各查一次再合并。
+11. **不少“创建特征”的 API 成功时返回 `None`**，不能拿返回值判成败；脚本改成比较调用前后
+    特征树有没有新增项。
+12. **选面标记因命令而异**：加厚是 `Select2(True, 1)`，偏移曲面是 `Select2(True, 0)`，
+    缝合体是 `Body2.Select(True, 1)`。标错时可能不报错但什么都不生成。
 
 ## 限制
 
 - 装配体配合、工程图视图、方程式/配置驱动：没有高层命令，用 `exec` 写 COM，或自行补
   `swbridge.py`。
-- 曲面：只能按**边**选，不能按面选；没有放样/扫描/边界凸台。
-- 单实体操作：多实体零件只核对第一个实体的质量属性。
+- 曲面：已支持拉伸/旋转/放样/扫描/平面/延伸/偏移/缝合/加厚，但**曲面裁剪（剪裁曲面）暂未
+  封装**——`PreTrimSurface` / `PostTrimSurface` 的选择标记与参数组合还没试通，
+  请先在界面里做，或用 `exec` 自行试验。也没有边界曲面（Boundary Surface）。
+- 选面只支持 `all` 与 `near:x,y,z`（三角面片质心就近），没有按面索引/名称选择。
+- 多实体零件：`volume_mm3` 已按实体求和，但 `mass_properties` 只报第一个实体。
 - `close` 遇到未保存的改动会弹窗阻塞（无人值守脚本请先 `save`）。
 - 只测过 Windows + SW2025 + 中文界面；英文界面按"第 1/2/3 个基准面"定位，理论可用但
   未实测。
