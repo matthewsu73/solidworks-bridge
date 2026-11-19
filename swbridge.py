@@ -291,7 +291,8 @@ class Bridge:
         m.ClearSelection2(True)
         if not target.Select2(False, 0):
             raise RuntimeError("cannot select plane %s" % val(target, "Name"))
-        m.CreatePlaneAtOffset3(distance * MM, False, True)
+        flip = distance < 0
+        m.CreatePlaneAtOffset3(abs(distance) * MM, flip, True)
         name = self._created_feature(before, m, "offset plane")
         m.ClearSelection2(True)
         return {"ok": True, "plane": name, "base": val(target, "Name")}
@@ -551,14 +552,19 @@ class Bridge:
         m.ClearSelection2(True)
         return {"ok": True, "feature": name}
 
-    def thicken(self, thickness, faces="all"):
+    def thicken(self, thickness, faces="all", merge=True):
+        """Thicken surface faces into a solid.
+
+        merge=False keeps the result as its own body, which is what a mould
+        cavity needs (the shell must stay separate so combine can subtract it).
+        """
         m = self.model
         before = self._feature_names(m)
         n = self.select_faces(faces, kind="surface", mark=1)
         if n == 0:
             raise RuntimeError("no surface faces matched %r" % faces)
         m.FeatureManager.FeatureBossThicken(
-            thickness * MM, 0, 0, False, True, False, False)
+            thickness * MM, 0, 0, False, bool(merge), False, False)
         name = self._created_feature(before, m, "thicken")
         m.ClearSelection2(True)
         return {
@@ -987,7 +993,8 @@ def cmd_save(b, a):
         if not os.path.isfile(path):
             raise RuntimeError("save failed")
         return {"ok": True, "path": path}
-    errors, warnings = 0, 0
+    errors = win32.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
+    warnings = win32.VARIANT(pythoncom.VT_BYREF | pythoncom.VT_I4, 0)
     m.Save3(1, errors, warnings)
     return {"ok": True, "path": val(m, "GetPathName")}
 
@@ -1058,7 +1065,7 @@ def cmd_surface_sweep(b, a):
 
 
 def cmd_thicken(b, a):
-    return b.thicken(a.thickness, faces=a.faces)
+    return b.thicken(a.thickness, faces=a.faces, merge=not a.no_merge)
 
 
 def cmd_offset_surface(b, a):
@@ -1207,6 +1214,7 @@ def build_parser():
     th = sub.add_parser("thicken")
     th.add_argument("--thickness", type=float, required=True)
     th.add_argument("--faces", default="all")
+    th.add_argument("--no-merge", action="store_true")
 
     ofs = sub.add_parser("offset-surface")
     ofs.add_argument("--distance", type=float, required=True)

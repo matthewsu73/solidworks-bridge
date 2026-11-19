@@ -81,13 +81,13 @@ $env:SW_PYTHON = "C:\Python312\python.exe"
 | `revolve --angle 360` | 旋转（草图里要有中心线/轴线） |
 | `fillet --radius 3 --edges vertical` | 圆角 |
 | `chamfer --distance 1 --edges vertical` | 倒角 |
-| `plane-offset --base front --distance 40` | 建偏移基准面，返回名字（如 `基准面1`）可直接给 `--plane` |
+| `plane-offset --base front --distance 40` | 建偏移基准面（`--distance` 可为负），返回名字（如 `基准面1`）可直接给 `--plane` |
 | `surface-plane` | 用草图生成平面区域曲面 |
 | `surface-extrude --depth 25` | 拉伸曲面（开口薄壳，不是实体） |
 | `surface-revolve --angle 360` | 旋转曲面（草图里要有中心线） |
 | `surface-loft --sketches 草图1,草图2` | 放样曲面 |
 | `surface-sweep --outline 草图1 --path 草图2` | 扫描曲面 |
-| `thicken --thickness 3` | 曲面加厚成实体，`--faces all\|near:x,y,z` |
+| `thicken --thickness 3` | 曲面加厚成实体，`--faces all\|near:x,y,z`，`--no-merge` 让结果独立成体 |
 | `offset-surface --distance 5` | 等距偏移曲面，`--faces all\|near:x,y,z` |
 | `sew` | 缝合曲面体，`--tolerance 0.01` |
 | `extend-surface --distance 10` | 延伸曲面边，`--edges all\|near:...` |
@@ -169,22 +169,31 @@ centerline x1 y1 x2 y2  构造线 / 旋转轴（旋转、旋转曲面用）
 
 ### 阳模 → 阴模（布尔求差）
 
-阴模的做法：先有 120×120×25 的料块，再把"阳模外表面 + 偏移/加厚"得到的实体从料块里减掉。
+阴模 = 料块 − 型芯。料块先拉伸成独立实体；型芯（曲面加厚得到的实体）也必须是**另一个实体**，
+再用 `combine subtract` 减掉。
 
 ```powershell
-# 1) 料块（不合并，保持独立实体）
+# 1) 120x120x25 料块
 .\sw.cmd new --type part
 .\sw.cmd sketch --plane front --shapes "rect 0 0 120 120"
-.\sw.cmd extrude --depth 25
+.\sw.cmd extrude --depth 25                            # 360000 mm3
 
-# 2) 阳模曲面：surface-plane / surface-loft / offset-surface ...
-#    加厚成实体（自动成为第 2 个实体）
-.\sw.cmd thicken --thickness 3 --faces all
+# 2) 型芯：曲面必须加厚成实体；--no-merge 让它保持独立（不加会直接并进料块）
+.\sw.cmd thicken --thickness 3 --faces all --no-merge
 
-# 3) 从料块里减掉型芯实体
+# 3) 从料块里减掉型芯
 .\sw.cmd combine --operation subtract --target largest
 .\sw.cmd info      # volume_mm3 变小，solid_bodies 回到 1
 ```
+
+已验证整条链路（`out\mould_cavity_demo.SLDPRT`）：料块 120×120×25，放样曲面
+80×80(z=3) → Ø50(z=20)，加厚 3，减除后 **341300.26 mm³，回到 1 个实体**。
+
+两个坑：
+
+- 加厚壳的边别正好贴在料块表面上。完全共面时 SW 会切不干净——实测会把料块切成两块、
+  或者留下碎料实体。壳体整块落在料块内部最稳；要开腔通到表面，用**实体**阳模做布尔更可靠。
+- `combine subtract` 只认实体，曲面体必须先 `thicken`。
 
 `--operation add` 合并、`intersect` 取交集；`--target` 默认取体积最大的实体（料块），
 `--tools all` 表示减掉其余所有实体。要看是哪几个实体参与，先跑一次 `info`。

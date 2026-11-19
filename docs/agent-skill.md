@@ -40,13 +40,13 @@ description: 用本机 SOLIDWORKS 2025 直接建模：新建零件/装配/工程
 | 截图 | `screenshot --out "out\view.bmp"` |
 | 跑 VBA 宏 | `macro "C:\path\m.swp"` |
 | 任意 COM 代码兜底 | `exec --code "..."`（预置 `sw`、`model`、`bridge`、`MM`、`val`） |
-| 偏移基准面 | `plane-offset --base front --distance 40`（返回名字，如 `基准面1`，可直接给 `--plane`） |
+| 偏移基准面 | `plane-offset --base front --distance 40`（`--distance` 可为负；返回名字，如 `基准面1`，可直接给 `--plane`） |
 | 平面区域曲面 | `surface-plane` |
 | 拉伸曲面 | `surface-extrude --depth 25`（开口薄壳，不是实体） |
 | 旋转曲面 | `surface-revolve --angle 360`（草图里要有 `centerline`） |
 | 放样曲面 | `surface-loft --sketches 草图1,草图2` |
 | 扫描曲面 | `surface-sweep --outline 草图1 --path 草图2` |
-| 加厚成实体 | `thicken --thickness 3 --faces all|near:x,y,z` |
+| 加厚成实体 | `thicken --thickness 3 --faces all|near:x,y,z [--no-merge]`（`--no-merge` 独立成体） |
 | 偏移曲面 | `offset-surface --distance 5 --faces all|near:x,y,z` |
 | 缝合曲面 | `sew --tolerance 0.01` |
 | 延伸曲面 | `extend-surface --distance 10 --edges all` |
@@ -127,24 +127,28 @@ centerline x1 y1 x2 y2            构造线/旋转轴（旋转、旋转曲面必
 
 ### 阳模 → 阴模（布尔求差）
 
-阴模 = 料块 − 型芯实体。料块先拉伸成独立实体，型芯用曲面加厚得到，然后：
+阴模 = 料块 − 型芯实体。料块先拉伸成独立实体，型芯加厚时必须带 `--no-merge`，
+否则壳体直接并进料块，减除就没东西可减：
 
 ```powershell
 .\sw.cmd sketch --plane front --shapes "rect 0 0 120 120"
-.\sw.cmd extrude --depth 25                 # 料块 360000 mm3
-# ...建阳模曲面，再 thicken 成实体...
+.\sw.cmd extrude --depth 25                              # 料块 360000 mm3
+.\sw.cmd thicken --thickness 3 --faces all --no-merge    # 型芯独立实体
 .\sw.cmd combine --operation subtract --target largest
 ```
 
 ```jsonc
 { "ok": true, "feature": "组合1", "operation": "subtract",
   "target": "凸台-拉伸1", "target_volume_mm3": 360000.0,
-  "tools": ["凸台-拉伸2"], "volume_before_mm3": [12566.37, 360000.0],
-  "volume_mm3": 347433.63, "solid_bodies": 1 }
+  "tools": ["加厚1"], "volume_before_mm3": [18715.03, 360000.0],
+  "volume_mm3": 341300.26, "solid_bodies": 1 }
 ```
 
 `--target` 默认 `largest`（体积最大的实体，通常就是料块）；`--tools all` 减掉其余全部实体。
 布尔只能作用于**实体**，所以型芯必须先 `thicken`。
+
+**共面要注意**：加厚壳的边正好落在料块表面时，SW 会切不干净（实测把料块切成两块，
+或留下碎料实体）。把壳体整块放进料块内部最稳；需要开腔直到表面时，改用实体阳模做减除。
 
 ## 标准工作流
 

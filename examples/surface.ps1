@@ -44,4 +44,19 @@ Step "boss"      @("extrude", "--depth", "10", "--no-merge")
 Step "combine"   @("combine", "--operation", "subtract", "--target", "largest")
 Step "info5"     @("info")
 
-Write-Host "expected: thicken 15900 mm3 / loft bbox 60x40x40 / sweep bbox 10x10x40 / subtract 347433.63 mm3" -ForegroundColor Green
+# 5. mould cavity from a thickened loft shell: 120x120x25 blank, loft 80x80(z=3) -> D50(z=20)
+#    thicken 3 --no-merge keeps the shell a separate body so combine can subtract it
+#    -> 341300.26 mm3, back to 1 solid body
+Step "new5"      @("new", "--type", "part")
+Step "sk7"       @("sketch", "--plane", "front", "--shapes", "rect 0 0 120 120")
+Step "blank2"    @("extrude", "--depth", "25")
+Step "plane2"    @("plane-offset", "--base", "front", "--distance", "3")
+Step "sk8"       @("sketch", "--plane", "基准面1", "--shapes", "rect 0 0 80 80")
+Step "plane3"    @("plane-offset", "--base", "基准面1", "--distance", "17")
+Step "sk9"       @("sketch", "--plane", "基准面2", "--shapes", "circle 0 0 25")
+Step "loft2"     @("surface-loft", "--sketches", "草图2,草图3")
+Step "shell"     @("thicken", "--thickness", "3", "--faces", "all", "--no-merge")
+Step "subtract"  @("combine", "--operation", "subtract", "--target", "largest")
+Step "info6"     @("info")
+
+Write-Host "expected: thicken 15900 mm3 / loft bbox 60x40x40 / sweep bbox 10x10x40 / subtract 347433.63 mm3 / cavity 341300.26 mm3" -ForegroundColor Green
